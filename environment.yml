@@ -3,7 +3,7 @@ name: zfel-dev
 channels:
   - conda-forge
 dependencies:
-  - python=3.9
+  - python=3.11
   - numpy
   - scipy
   - tqdm
@@ -23,6 +23,7 @@ dependencies:
   - flake8
   - pip
   - pip:
+    - -e .
     - ufmt
 #  - pip:
 #    - git+git://github.com/some/repo
