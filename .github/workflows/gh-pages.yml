@@ -21,7 +21,12 @@ jobs:
           miniforge-variant: Miniforge3
           channels: conda-forge
           activate-environment: zfel-dev
-          environment-file: environment.yml
+
+      - name: Create/Update Conda Environment
+        shell: bash -l {0}
+        run: |
+          conda env list | awk '{print $1}' | grep -Fxq zfel-dev || mamba create -y -n zfel-dev python=${{ matrix.python-version }}
+          mamba env update --name zfel-dev --file environment.yml
 
       - name: Execute notebooks
         shell: bash -l {0}
