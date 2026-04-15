@@ -1,0 +1,4 @@
+method,best_ratio_vs_no_taper,best_final_power_gw,heldout_mean_ratio,heldout_std_ratio,objective_calls,elapsed_s
+Gradient (autodiff),1.023421,39.577083,1.289313,0.149453,5,6.383475
+Powell (derivative-free),1.128189,43.628626,1.323032,0.230763,8,1.346747
+Random search,1.192958,46.133337,1.242108,0.186579,8,1.324017

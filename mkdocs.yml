@@ -4,6 +4,7 @@ repo_name: slaclab/zfel
 
 nav:
     - Home: index.md
+    - Optimization Benchmarks: optimization_benchmark.md
     - Examples:
       - examples/sase.ipynb 
       - examples/taper.ipynb
@@ -69,7 +70,6 @@ plugins:
             rendering:
               show_source: true
               show_root_heading: true
-
 
 
 

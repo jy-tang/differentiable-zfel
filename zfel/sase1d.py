@@ -2,7 +2,12 @@ import numpy as np
 import scipy
 from scipy import special
 
-from zfel.particles import general_load_bucket
+from zfel.particles import (
+    general_load_bucket,
+    shot_noise_spec,
+    sample_shot_noise_numpy,
+    bucket_from_shot_noise,
+)
 from zfel.fel import FEL_process_complex, final_calc
 
 # Some constant values
@@ -58,32 +63,66 @@ def sase(inp_struct):
     Ns                          # real number of examples
     """
 
-    # calculating intermediate parameters
     params = params_calc(**inp_struct)
+    bucket_data = fixed_or_external_bucket_data(
+        params=params,
+        npart=inp_struct["npart"],
+        s_steps=inp_struct["s_steps"],
+        particle_position=inp_struct.get("particle_position"),
+        hist_rule=inp_struct.get("hist_rule", "square-root"),
+        iopt=inp_struct.get("iopt", "sase"),
+        random_seed=inp_struct.get("random_seed"),
+    )
+    return sase_from_initial_conditions(params, bucket_data)
 
-    # Load Buckets
+
+def fixed_or_external_bucket_data(
+    *,
+    params,
+    npart,
+    s_steps,
+    particle_position=None,
+    hist_rule="square-root",
+    iopt="sase",
+    random_seed=None,
+):
+    """
+    Build bucket data outside the deterministic FEL solver.
+
+    This function can be replaced by externally generated fixed bucket data
+    when using autodiff workflows.
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
     bucket_params = {
-        "npart": inp_struct["npart"],
+        "npart": npart,
         "Ns": params["Ns"],
         "coopLength": params["coopLength"],
-        "particle_position": inp_struct["particle_position"],
-        "s_steps": inp_struct["s_steps"],
+        "particle_position": particle_position,
+        "s_steps": s_steps,
         "dels": params["dels"],
-        "hist_rule": inp_struct["hist_rule"],
+        "hist_rule": hist_rule,
         "gbar": params["gbar"],
         "delg": params["delg"],
-        "iopt": inp_struct["iopt"],
+        "iopt": iopt,
     }
-    bucket_data = general_load_bucket(**bucket_params)
+    return general_load_bucket(**bucket_params)
 
-    # Convenience
-    i = inp_struct
+
+def sase_from_initial_conditions(params, bucket_data):
+    """
+    Deterministic FEL solve from fixed parameters and bucket initial conditions.
+    """
     p = params
+    b = bucket_data
+    npart = b["thet_init"].shape[1]
+    s_steps = int(b["s_steps"])
+    z_steps = len(p["kappa_1"])
 
-    # FEL process
     FEL_data = FEL_process_complex(
-        i["npart"],
-        i["z_steps"],
+        npart,
+        z_steps,
         p["kappa_1"],
         p["density"],
         p["Kai"],
@@ -91,20 +130,18 @@ def sase(inp_struct):
         p["delt"],
         p["dels"],
         p["deta"],
-        bucket_data["thet_init"],
-        bucket_data["eta_init"],
-        bucket_data["N_real"],
-        i["s_steps"],
+        b["thet_init"],
+        b["eta_init"],
+        b["N_real"],
+        s_steps,
         E02=p["E02"],
     )
 
-    # Finalize
     final_data = final_calc(
         FEL_data["Er"],
         FEL_data["Ei"],
-        # FEL_data['eta'],
-        i["s_steps"],
-        i["z_steps"],
+        s_steps,
+        z_steps,
         p["kappa_1"],
         p["density"],
         p["Kai"],
@@ -113,18 +150,14 @@ def sase(inp_struct):
         p["dels"],
     )
 
-    # Collect output
     output = FEL_data
     output.update(final_data)
     output["params"] = params
 
-    # Extra (put somewhere else)
     s = (
-        np.arange(1, i["s_steps"] + 1) * p["dels"] * p["coopLength"]
+        np.arange(1, s_steps + 1) * p["dels"] * p["coopLength"]
     )  # longitundinal steps along beam in m
-    z = (
-        np.arange(1, i["z_steps"] + 1) * p["delt"]
-    )  # longitundinal steps along undulator in meter
+    z = np.arange(1, z_steps + 1) * p["delt"]  # longitundinal steps along undulator in m
     bunchLength = s[-1]  # beam length in meter
     bunch_steps = np.round(
         bunchLength / p["delt"] / p["coopLength"]
@@ -137,10 +170,261 @@ def sase(inp_struct):
     omega = hbar * 2.0 * np.pi / (p["resWavelength"] / c)
     df = hbar * 2.0 * np.pi * 1 / (bunchLength / c)
     output["freq"] = np.linspace(
-        omega - i["s_steps"] / 2 * df, omega + i["s_steps"] / 2 * df, i["s_steps"]
+        omega - s_steps / 2 * df, omega + s_steps / 2 * df, s_steps
     )
 
     return output
+
+
+def sase_from_initial_conditions_jax(params, bucket_data):
+    """
+    JAX-backed deterministic FEL solve from fixed parameters and bucket data.
+
+    The interface matches sase_from_initial_conditions(params, bucket_data).
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError(
+            "JAX is required for sase_from_initial_conditions_jax. "
+            "Install jax and jaxlib to enable autodiff."
+        ) from exc
+
+    # Match NumPy's default float64 behavior for better numerical agreement.
+    jax.config.update("jax_enable_x64", True)
+
+    from zfel.fel_jax import FEL_process_complex_jax, final_calc_jax
+
+    def _to_jax_float64(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.integer):
+            return arr
+        return arr.astype(jnp.float64)
+
+    p = {k: _to_jax_float64(v) for k, v in params.items()}
+    b = {
+        k: (_to_jax_float64(v) if k != "s_steps" else int(v))
+        for k, v in bucket_data.items()
+    }
+
+    npart = b["thet_init"].shape[1]
+    s_steps = int(b["s_steps"])
+    z_steps = len(p["kappa_1"])
+
+    FEL_data = FEL_process_complex_jax(
+        npart,
+        z_steps,
+        p["kappa_1"],
+        p["density"],
+        p["Kai"],
+        p["ku"],
+        p["delt"],
+        p["dels"],
+        p["deta"],
+        b["thet_init"],
+        b["eta_init"],
+        b["N_real"],
+        s_steps,
+        E02=p["E02"],
+    )
+
+    final_data = final_calc_jax(
+        FEL_data["Er"],
+        FEL_data["Ei"],
+        s_steps,
+        z_steps,
+        p["kappa_1"],
+        p["density"],
+        p["Kai"],
+        p["Pbeam"],
+        p["delt"],
+        p["dels"],
+    )
+
+    output = FEL_data
+    output.update(final_data)
+    output["params"] = p
+
+    s = jnp.arange(1, s_steps + 1) * p["dels"] * p["coopLength"]
+    z = jnp.arange(1, z_steps + 1) * p["delt"]
+    bunchLength = s[-1]
+    bunch_steps = jnp.round(bunchLength / p["delt"] / p["coopLength"])
+    output["s"] = s
+    output["z"] = z
+    output["bunchLength"] = bunchLength
+    output["bunch_steps"] = bunch_steps
+
+    omega = hbar * 2.0 * jnp.pi / (p["resWavelength"] / c)
+    df = hbar * 2.0 * jnp.pi * 1 / (bunchLength / c)
+    output["freq"] = jnp.linspace(omega - s_steps / 2 * df, omega + s_steps / 2 * df, s_steps)
+
+    return output
+
+
+def FEL_sim(params, noise, noise_spec):
+    """
+    Deterministic single-realization FEL simulation with explicit shot noise.
+    """
+    bucket_data = bucket_from_shot_noise(
+        {
+            **noise_spec,
+            "eta_randn": noise["eta_randn"],
+            "theta_rand": noise["theta_rand"],
+        },
+        gbar=params["gbar"],
+        delg=params["delg"],
+        Ns=params["Ns"],
+    )
+    return sase_from_initial_conditions(params, bucket_data)
+
+
+def FEL_sim_jax(params, noise, noise_spec):
+    """
+    JAX deterministic single-realization FEL simulation with explicit shot noise.
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError(
+            "JAX is required for FEL_sim_jax. Install jax and jaxlib."
+        ) from exc
+
+    jax.config.update("jax_enable_x64", True)
+    from zfel.noise_jax import bucket_from_shot_noise_jax
+
+    def _to_jax_float64(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.integer):
+            return arr
+        return arr.astype(jnp.float64)
+
+    p = {k: _to_jax_float64(v) for k, v in params.items()}
+    n = {k: _to_jax_float64(v) for k, v in noise.items()}
+
+    bucket_data = bucket_from_shot_noise_jax(
+        noise_spec,
+        n,
+        gbar=p["gbar"],
+        delg=p["delg"],
+        Ns=p["Ns"],
+    )
+    return sase_from_initial_conditions_jax(p, bucket_data)
+
+
+def make_shot_noise_spec_from_params(params, *, npart, s_steps, iopt="sase"):
+    """
+    Build a reusable shot-noise specification for explicit-noise workflows.
+    """
+    # params is currently unused but kept to align with theta/physics workflows.
+    _ = params
+    return shot_noise_spec(npart=npart, s_steps=s_steps, iopt=iopt)
+
+
+def sample_shot_noise_batch_numpy(noise_spec, n_samples, seed=0):
+    """
+    Generate a batch of explicit noise realizations (NumPy), useful for CRN.
+    """
+    rng = np.random.default_rng(seed)
+    noises = [sample_shot_noise_numpy(noise_spec, rng=rng) for _ in range(int(n_samples))]
+    return {
+        "eta_randn": np.stack([n["eta_randn"] for n in noises], axis=0),
+        "theta_rand": np.stack([n["theta_rand"] for n in noises], axis=0),
+    }
+
+
+def sample_shot_noise_batch_jax(key, noise_spec, n_samples):
+    """Generate a batch of explicit noise realizations (JAX)."""
+    try:
+        from zfel.noise_jax import sample_shot_noise_batch_jax as _sample
+    except ImportError as exc:
+        raise ImportError(
+            "JAX is required for sample_shot_noise_batch_jax. Install jax and jaxlib."
+        ) from exc
+    return _sample(key, noise_spec, n_samples)
+
+
+def default_loss_final_power(output):
+    """Default scalar objective: final-z output power."""
+    return output["power_z"][-1]
+
+
+def default_loss_pulse_energy(output):
+    """Pulse-energy-like scalar objective from final-z longitudinal profile."""
+    return np.sum(output["power_s"][-1])
+
+
+def default_loss_final_power_jax(output):
+    """JAX default scalar objective: final-z output power."""
+    return output["power_z"][-1]
+
+
+def default_loss_pulse_energy_jax(output):
+    """JAX pulse-energy-like scalar objective from final-z longitudinal profile."""
+    return output["power_s"][-1].sum()
+
+
+def mc_objective_jax(params, noise_batch, noise_spec, loss_fn=None):
+    """
+    Monte Carlo objective:
+        J_hat(theta) = (1/N) sum_i loss_fn(FEL_sim_jax(theta, noise_i))
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError(
+            "JAX is required for mc_objective_jax. Install jax and jaxlib."
+        ) from exc
+
+    if loss_fn is None:
+        loss_fn = default_loss_final_power_jax
+
+    jax.config.update("jax_enable_x64", True)
+
+    def _cast_leaf(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.integer):
+            return arr.astype(jnp.float64)
+        return arr
+
+    params = jax.tree_util.tree_map(_cast_leaf, params)
+
+    def _one(noise_i):
+        out = FEL_sim_jax(params, noise_i, noise_spec)
+        return loss_fn(out)
+
+    losses = jax.vmap(_one)(noise_batch)
+    return jnp.mean(losses)
+
+
+def mc_value_and_grad_jax(params, noise_batch, noise_spec, loss_fn=None):
+    """
+    Return Monte Carlo objective value and gradient w.r.t. params.
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError(
+            "JAX is required for mc_value_and_grad_jax. Install jax and jaxlib."
+        ) from exc
+
+    jax.config.update("jax_enable_x64", True)
+
+    def _cast_leaf(x):
+        arr = jnp.asarray(x)
+        if jnp.issubdtype(arr.dtype, jnp.integer):
+            return arr.astype(jnp.float64)
+        return arr
+
+    params_cast = jax.tree_util.tree_map(_cast_leaf, params)
+
+    def _obj(p):
+        return mc_objective_jax(p, noise_batch, noise_spec, loss_fn=loss_fn)
+
+    return jax.value_and_grad(_obj)(params_cast)
 
 
 def params_calc(
@@ -166,9 +450,8 @@ def params_calc(
     """
     calculating intermediate parameters
     """
-    # whether to use constant random seed for reproducibility
-    if random_seed is not None:
-        np.random.seed(random_seed)
+    # random_seed is accepted for backward compatibility but is intentionally
+    # ignored here. Keep stochastic behavior in bucket loading functions.
 
     # Check if unduK is array. Otherwise, fill it out.
     if not isinstance(unduK, np.ndarray):

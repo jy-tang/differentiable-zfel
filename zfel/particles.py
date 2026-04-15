@@ -1,5 +1,99 @@
 import numpy as np
 
+
+def shot_noise_spec(npart, s_steps, iopt="sase"):
+    """
+    Describe the random degrees of freedom used to generate shot noise.
+
+    This allows noise sampling to be externalized and passed explicitly to the
+    solver as an input xi.
+    """
+    if iopt == "seeded":
+        M = 128
+    elif iopt == "sase":
+        M = 32
+    else:
+        raise ValueError(f"Unknown iopt: {iopt}")
+
+    nb = int(np.round(npart / M))
+    if M * nb != npart:
+        raise ValueError("npart must be a multiple of beamlet size M")
+
+    return {
+        "npart": int(npart),
+        "s_steps": int(s_steps),
+        "iopt": iopt,
+        "M": int(M),
+        "nb": int(nb),
+    }
+
+
+def sample_shot_noise_numpy(spec, seed=None, rng=None):
+    """
+    Sample explicit shot-noise variables (xi) for one simulation realization.
+    """
+    if rng is None:
+        rng = np.random.default_rng(seed)
+
+    s_steps = int(spec["s_steps"])
+    nb = int(spec["nb"])
+    M = int(spec["M"])
+    iopt = spec["iopt"]
+
+    noise = {"eta_randn": rng.standard_normal((s_steps, nb))}
+    if iopt == "sase":
+        noise["theta_rand"] = rng.random((s_steps, nb, M))
+    else:
+        noise["theta_rand"] = np.zeros((s_steps, nb, M))
+    return noise
+
+
+def bucket_from_shot_noise(spec, *, gbar, delg, Ns):
+    """
+    Deterministically build bucket data from explicit shot-noise variables.
+
+    Parameters
+    ----------
+    spec:
+        dict from shot_noise_spec(...), augmented with:
+        - eta_randn: shape (s_steps, nb)
+        - theta_rand: shape (s_steps, nb, M), used for iopt='sase'
+    """
+    s_steps = int(spec["s_steps"])
+    npart = int(spec["npart"])
+    nb = int(spec["nb"])
+    M = int(spec["M"])
+    iopt = spec["iopt"]
+
+    eta_randn = np.asarray(spec["eta_randn"])
+    theta_rand = np.asarray(spec["theta_rand"])
+
+    if eta_randn.shape != (s_steps, nb):
+        raise ValueError("eta_randn has incompatible shape")
+    if theta_rand.shape != (s_steps, nb, M):
+        raise ValueError("theta_rand has incompatible shape")
+
+    base = 2 * np.pi * (np.arange(M) + 1) / M
+    theta_base = np.tile(base, nb)[np.newaxis, :]
+    eta_beamlet = delg * eta_randn + gbar
+    eta_init = np.repeat(eta_beamlet, M, axis=1)
+
+    if iopt == "sase":
+        effnoise = np.sqrt(3 * M / (Ns / nb))
+        thet_init = theta_base + 2 * effnoise * theta_rand.reshape(s_steps, npart)
+    elif iopt == "seeded":
+        thet_init = np.broadcast_to(theta_base, (s_steps, npart))
+    else:
+        raise ValueError(f"Unknown iopt: {iopt}")
+
+    return {
+        "thet_init": np.asarray(thet_init),
+        "eta_init": np.asarray(eta_init),
+        "N_real": np.ones(s_steps),
+        "s_steps": s_steps,
+    }
+
+
 def general_load_bucket(
     npart,
     Ns,
